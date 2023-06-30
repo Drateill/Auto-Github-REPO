@@ -1,0 +1,361 @@
+---
+name: Plan
+
+on:
+  pull_request:
+    branches:
+      - main
+
+
+env:
+  # TERRAFORM
+  TF_VERSION: "1.4.2"
+  TF_BACKEND_FILE: "../conf/prd.azure.tfbackend"
+  TF_VARS_FILE: "<(cat ../conf/prd*.tfvars)"
+  TF_ROOT: "terraform"
+  TF_PLAN: "plan.tfplan"
+
+  # OPA
+  OPA_ENABLED: "false"
+  OPA_VERSION: v0.49.0
+  OPA_REGO_PATH: OPA/rules
+  OPA_REGO_FILE: repo.rego
+  OPA_RESULT_FILE: result.json
+  OPA_RESULT_PATH: OPA
+
+  # CHECKOV
+  CHECKOV_ENABLED: "true"
+  CHECKOV_DOWNLOAD_EXTERNAL_MODULES: "true"
+  CHECKOV_SKIP_CHECK: "CKV2_AZURE_31"
+
+  # AZURE
+  ARM_CLIENT_ID: ${{ secrets.ARM_CLIENT_ID }}
+  ARM_CLIENT_SECRET: ${{ secrets.ARM_CLIENT_SECRET }}
+  ARM_TENANT_ID: ${{ secrets.ARM_TENANT_ID }}
+  ARM_SUBSCRIPTION_ID: ${{ secrets.ARM_SUBSCRIPTION_ID }}
+
+
+permissions:
+  id-token: write
+  contents: read
+  pull-requests: write
+  actions: read
+  security-events: write
+
+
+jobs:
+
+  # PLAN ######################################################
+  terraform-plan:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        shell: bash
+        working-directory: ${{ env.TF_ROOT }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v3
+        with:
+          fetch-depth: 0
+
+      - name: Github Enterprise configuration
+        run: |
+          # Update git config using Github token
+          if [[ -n "${{ secrets.GH_TOKEN }}" ]]; then
+            git config --global url."https://${{ secrets.GH_TOKEN }}:x-oauth-basic@github.kyndryl.net".insteadOf "https://github.kyndryl.net"
+          else
+            echo "Need Personal Access Token to access Kyndryl Github repositories"
+          fi
+
+      - name: Setup Node.JS for Terraform wrapper
+        uses: actions/setup-node@v3
+        with:
+          node-version: 'lts/*'
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v2
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          terraform_wrapper: false
+
+      - name: Terraform Format
+        id: fmt
+        run: terraform fmt -check -recursive
+
+      - name: Terraform Init
+        id: init
+        run: terraform init -input=false -no-color -backend-config="${TF_BACKEND_FILE}"
+      
+      - name: Terraform Validate
+        id: validate
+        run: | 
+          terraform validate
+          echo "stdout=$(terraform validate -no-color)" >> "$GITHUB_OUTPUT"
+
+      - name: Terraform Plan
+        id: plan
+        run: |
+          # Generating Terraform plan (binary and json format)
+          terraform refresh >/dev/null -input=false -no-color -lock=false -var-file=${{ env.TF_VARS_FILE }} \
+          && terraform plan -no-color -input=false -refresh=false -lock=false -var-file=${{ env.TF_VARS_FILE }} -out=${{ env.TF_PLAN }}
+          terraform show -json ${{ env.TF_PLAN }} > ${{ env.TF_PLAN }}.json 
+          terraform show -no-color ${{ env.TF_PLAN }} > ${{ env.TF_PLAN }}.out
+        continue-on-error: true
+
+      - name: Add plan to pull request comment
+        uses: actions/github-script@v6
+        if: github.event_name == 'pull_request'
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            // 0. manage long plan
+            const run_url = process.env.GITHUB_SERVER_URL + '/' + process.env.GITHUB_REPOSITORY + '/actions/runs/' + process.env.GITHUB_RUN_ID
+            const run_link = '<a href="' + run_url + '">Actions</a>.'
+            const fs = require('fs')
+            const plan_file = fs.readFileSync(process.env.TF_ROOT + '/' + process.env.TF_PLAN + '.out', 'utf8')
+            const plan = plan_file.length > 65000 ? plan_file.toString().substring(0, 65000) + " ..." : plan_file
+            const truncated_message = plan_file.length > 65000 ? "Output is too long and was truncated. You can read full Plan in " + run_link + "<br /><br />" : ""
+            // 1. Retrieve existing bot comments for the PR
+            const { data: comments } = await github.rest.issues.listComments({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+            })
+            const botComment = comments.find(comment => {
+              return comment.user.type === 'Bot' && comment.body.includes('Terraform Format and Style')
+            })
+
+            // 2. Prepare format of the comment
+            const output = `#### Terraform Format and Style 🖌\`${{ steps.fmt.outcome }}\`
+            #### Terraform Initialization ⚙️\`${{ steps.init.outcome }}\`
+            #### Terraform Validation 🤖\`${{ steps.validate.outcome }}\`
+            <details><summary>Validation Output</summary>
+
+            \`\`\`\n
+            ${{ steps.validate.outputs.stdout }}
+            \`\`\`
+
+            </details>
+
+            #### Terraform Plan 📖\`${{ steps.plan.outcome }}\`
+            
+            <details><summary>Show Plan</summary>
+            
+            \`\`\`\n
+            ${plan}
+            \`\`\`
+            
+            </details>
+            ${truncated_message}
+            
+            *Pusher: @${{ github.actor }}, Action: \`${{ github.event_name }}\`, Working Directory: \`${{ env.TF_ROOT }}\`, Workflow: \`${{ github.workflow }}\`*`;
+            
+            // 3. If we have a comment, update it, otherwise create a new one
+            if (botComment) {
+              github.rest.issues.updateComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                comment_id: botComment.id,
+                body: output
+              })
+            } else {
+              github.rest.issues.createComment({
+                issue_number: context.issue.number,
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                body: output
+              })
+            }
+
+      - name: Terraform Plan Status
+        if: steps.plan.outcome == 'failure'
+        run: exit 1
+
+      - name: Compress TF Plan artifacts
+        run: |
+          zip -r ${{ env.TF_PLAN }}.zip ./*
+
+      - name: Upload Artifacts
+        uses: actions/upload-artifact@v3
+        with:
+          name: ${{ env.TF_PLAN }}
+          path: "${{ env.TF_ROOT }}/${{ env.TF_PLAN }}.zip"
+          retention-days: 1
+
+
+  # CHECKOV ###################################################
+  security:   
+    needs: [terraform-plan]
+    runs-on: ubuntu-latest
+    container: ghcr.io/bridgecrewio/checkov:2.3.84
+    steps:
+
+      - name: Github Enterprise configuration
+        run: |
+          # Update git config using Github token
+          if [[ -n "${{ secrets.GH_TOKEN }}" ]]; then
+            git config --global url."https://${{ secrets.GH_TOKEN }}:x-oauth-basic@github.kyndryl.net".insteadOf "https://github.kyndryl.net"
+          else
+            echo "Need Personal Access Token to access Kyndryl Github repositories"
+          fi
+
+      - name: Checkout Code
+        uses: actions/checkout@v3
+
+      - name: Checkov
+        if: ${{ env.CHECKOV_ENABLED != 'false' }}
+        env:
+          BC_SKIP_MAPPING: true
+        run: |
+          # Run Checkov 
+          if [[ -n "${{ env.CHECKOV_SKIP_CHECK }}" ]]; then
+            checkov \
+              --directory ${{ env.TF_ROOT }} \
+              --download-external-modules ${{ env.CHECKOV_DOWNLOAD_EXTERNAL_MODULES}} \
+              --framework terraform \
+              --skip-check ${{ env.CHECKOV_SKIP_CHECK }}
+          else
+            checkov \
+              --directory ${{ env.TF_ROOT }} \
+              --download-external-modules ${{ env.CHECKOV_DOWNLOAD_EXTERNAL_MODULES}} \
+              --framework terraform
+          fi
+
+
+  # OPA #######################################################
+  compliance:
+    needs: [terraform-plan]
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        shell: bash
+
+    steps:
+      - name: "Open Policy Agent"
+        if: ${{ env.OPA_ENABLED == 'false' }}
+        run: echo "OPA checks disabled"
+      
+      - name: "Checkout code"
+        if: ${{ env.OPA_ENABLED != 'false' }}
+        uses: actions/checkout@v2
+  
+      - name: "Install OPA"
+        if: ${{ env.OPA_ENABLED != 'false' }}
+        run: |
+          sudo apt-get update
+          sudo apt-get install wget jq -y
+          wget https://github.com/open-policy-agent/opa/releases/download/"$OPA_VERSION"/opa_linux_amd64
+          sudo mv opa_linux_amd64 /usr/local/bin/opa
+          sudo chmod 755 /usr/local/bin/opa
+
+      - name: Download Artifacts
+        if: ${{ env.OPA_ENABLED != 'false' }}
+        uses: actions/download-artifact@v3
+        with:
+          name: ${{ env.TF_PLAN }}
+          path: ${{ env.TF_ROOT }}
+
+      - name: Decompress TF Plan artifacts
+        if: ${{ env.OPA_ENABLED != 'false' }}
+        run: |
+          unzip "${TF_ROOT}/${TF_PLAN}.zip" -d "${OPA_REGO_PATH}/$TF_ROOT"
+  
+      - name: "Check REPO Compliance"
+        if: ${{ env.OPA_ENABLED != 'false' }}
+        run: |
+          # OPA eval
+          opa eval -i "${OPA_REGO_PATH}/$TF_ROOT/$TF_PLAN_json" -d "${OPA_REGO_PATH}/$OPA_REGO_FILE" "data.main.deny" -f pretty > "${OPA_RESULT_PATH}/${OPA_RESULT_FILE}"
+          ls "${OPA_RESULT_PATH}/${OPA_RESULT_FILE}"
+          cat "${OPA_RESULT_PATH}/${OPA_RESULT_FILE}"
+      
+      - name: "[+] Show result.json"
+        if: ${{ env.OPA_ENABLED != 'false' }}
+        run: cat "${OPA_RESULT_PATH}/${OPA_RESULT_FILE}"
+
+      - name: "Exit on error"
+        if: ${{ env.OPA_ENABLED != 'false' }}
+        run: |
+          # Exit 1 if error
+          if [[ -z $(jq -r '.[] | @base64' "${OPA_RESULT_PATH}/${OPA_RESULT_FILE}") ]]; then
+              exit 0
+          else
+              exit 1
+          fi
+
+
+  # INFRACOST #################################################
+  finops:
+    needs: [terraform-plan]
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        shell: bash
+
+    steps:
+
+      - name: Download Artifacts
+        uses: actions/download-artifact@v3
+        with:
+          name: ${{ env.TF_PLAN }}
+          path: ${{ env.TF_ROOT }}
+
+      - name: Decompress TF Plan artifacts
+        run: |
+          unzip "${{ env.TF_ROOT }}/${TF_PLAN}.zip"
+
+      - name: Setup Infracost
+        uses: infracost/actions/setup@v2
+        with:
+          api-key: ${{ secrets.INFRACOST_API_KEY }}
+          version: v0.10.8
+          currency: EUR
+
+      - name: Generate Infracost JSON
+        id: infracost
+        run: |
+          infracost breakdown --path "$TF_PLAN.json" --format json --out-file infracost.json
+          COST_CMD="$(infracost output --path infracost.json --format github-comment)"
+          COST_CMD="${COST_CMD//'%'/'%25'}"
+          COST_CMD="${COST_CMD//$'\n'/'%0A'}"
+          COST_CMD="${COST_CMD//$'\r'/'%0D'}"
+          echo "::set-output name=COST::$COST_CMD"  ## to be update (see below)
+        # echo "COST=$COST_CMD" >> "$GITHUB_OUTPUT"  ## correction for actionlint not working on GHE (09/03/"2023)
+
+      - name: Add infracost estimate to pull request comment
+        uses: actions/github-script@v6
+        if: github.event_name == 'pull_request'
+        env:
+          ESTIMATE: "${{ steps.infracost.outputs.COST }}"
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            // 1. Retrieve existing bot comments for the PR
+            const { data: comments } = await github.rest.issues.listComments({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+            })
+            const costComment = comments.find(comment => {
+              return comment.user.type === 'Bot' && comment.body.includes('Infracost estimate')
+            })
+
+            // 2. Prepare format of the comment
+            const output = `${process.env.ESTIMATE}`
+
+            // 3. If we have a comment, update it, otherwise create a new one
+            if (costComment) {
+              github.rest.issues.updateComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                comment_id: costComment.id,
+                body: output
+              })
+            } else {
+              github.rest.issues.createComment({
+                issue_number: context.issue.number,
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                body: output
+              })
+            }
