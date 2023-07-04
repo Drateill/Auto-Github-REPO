@@ -1,0 +1,53 @@
+---
+name: Documentation
+
+on:
+  # pull_request:
+  #   branches:
+  #     - main
+  workflow_dispatch:
+
+env: 
+  TERRAFORM_DOCS_VERSION: "0.16.0"
+  TF_ROOT: "terraform"
+  README_FILE: "README.md"
+  HEAD_REF: ${{ github.event.pull_request.head.ref }}
+
+permissions:
+  contents: write
+
+jobs:
+  docs:
+    runs-on: ubuntu-latest
+    steps:
+
+      - name: Checkout out
+        uses: actions/checkout@v3
+        with:
+          fetch-depth: 0
+          # ref: ${{ github.event.pull_request.head.ref }}
+
+      - name: Terraform Docs
+        run: |
+          # terraform-docs using docker image
+          docker run --rm --volume "$(pwd):/terraform-docs" -u "$(id -u)" "quay.io/terraform-docs/terraform-docs:${TERRAFORM_DOCS_VERSION}" markdown table --output-file "../${README_FILE}" "/terraform-docs/${TF_ROOT}"
+          
+      - name: Commit Changes
+        run: |
+          # Using git to commit changes
+          if [[ -n "${{ secrets.GH_TOKEN }}" ]]; then
+            git config --global url."https://${{ secrets.GH_TOKEN }}:x-oauth-basic@github.kyndryl.net".insteadOf "https://github.kyndryl.net"
+          else
+            echo "Need Personal Access Token to access Kyndryl Github repositories"
+          fi
+          git config --global --add safe.directory /github/workspace
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+          git fetch --depth=1 origin +refs/tags/*:refs/tags/* || true
+          if [ "$(git status --porcelain | grep "$file" | grep -c -E '([MA]\W).+')" -eq 1 ]; then
+            git add "./${{ env.README_FILE }}"
+            git commit -m "docs: terraform-docs update"
+            git push origin "HEAD:${HEAD_REF}"
+          else
+            echo "No change in ${{ env.README_FILE }} detected"
+          fi

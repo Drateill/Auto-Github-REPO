@@ -1,0 +1,67 @@
+---
+name: Lint
+
+on:
+  pull_request:
+    branches:
+      - main
+
+env:
+  FILTER_REGEX_EXCLUDE: 'plan.yml'
+  GITHUB_CUSTOM_API_URL: https://github.kyndryl.net/api/v3/
+  GITHUB_DOMAIN: github.kyndryl.net
+
+jobs:
+  lint-commit:
+    name: Lint commit
+    runs-on: ubuntu-latest
+    steps:
+
+      - name: Checkout out
+        uses: actions/checkout@v3
+        with:
+          fetch-depth: 0
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v3
+        with:
+          node-version: "lts/*"
+
+      - name: Install dependencies
+        run: |
+          npm install @commitlint/cli @commitlint/config-conventional
+          echo "module.exports = {extends: ['@commitlint/config-conventional']}" > commitlint.config.js
+
+      - name: Validate all commits from PR
+        run: |
+          npx commitlint \
+            --from ${{ github.event.pull_request.base.sha }} \
+            --to ${{ github.event.pull_request.head.sha }} \
+            --verbose
+
+  lint-code:
+    name: Lint code
+    runs-on: ubuntu-latest
+    container: github/super-linter:slim-v4
+    steps:
+  
+      - name: Checkout Code
+        uses: actions/checkout@v3
+
+      - name: Github Enterprise configuration
+        run: |
+          # Update git config using Github token
+          if [[ -n "${{ secrets.GH_TOKEN }}" ]]; then
+            git config --global url."https://${{ secrets.GH_TOKEN }}:x-oauth-basic@${{ env.GITHUB_DOMAIN }}".insteadOf "https://${{ env.GITHUB_DOMAIN }}"
+          fi
+
+      - name: Lint Code Base
+        env:
+          DEFAULT_BRANCH: ${{ github.base_ref }}
+          GITHUB_CUSTOM_API_URL: ${{ env.GITHUB_CUSTOM_API_URL }}
+          GITHUB_DOMAIN: ${{ env.GITHUB_DOMAIN }}
+          GITHUB_TOKEN: ${{ secrets.GH_TOKEN }}
+          VALIDATE_ALL_CODEBASE: false
+          VALIDATE_TERRAFORM_TERRASCAN: false
+          FILTER_REGEX_EXCLUDE: ${{ env.FILTER_REGEX_EXCLUDE }}
+        run: /action/lib/linter.sh

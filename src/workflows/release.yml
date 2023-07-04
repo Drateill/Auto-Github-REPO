@@ -1,0 +1,63 @@
+---
+name: Release
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write        # to be able to publish a GitHub release
+  issues: write          # to be able to comment on released issues
+  pull-requests: write   # to be able to comment on released pull requests
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    environment: release
+    steps:
+
+      - name: Checkout
+        uses: actions/checkout@v3
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v3
+        with:
+          node-version: "lts/*"
+
+      - name: Install plugins
+        run: |
+          npm install \
+            @semantic-release/git \
+            @semantic-release/changelog \
+            conventional-changelog-conventionalcommits -D
+
+      - name: Configuration
+        run: |
+          # Setup Semantic Release configuration
+          if [ -f ".releaserc" ]; then
+            echo "File .releaserc exists"
+          else
+            cat <<EOT >> .releaserc
+          {
+            "branches": ["main", "master"],
+            "plugins": [
+              "@semantic-release/commit-analyzer",
+              "@semantic-release/release-notes-generator",
+              "@semantic-release/changelog",
+              "@semantic-release/github",
+              ["@semantic-release/git", {
+                "assets": ["CHANGELOG.md"],
+                "message": "chore(release): \${nextRelease.version} [skip ci]\n\n\${nextRelease.notes}"
+              }]
+            ]
+          }
+          EOT
+          echo "Default .releaserc created"
+          fi
+
+      - name: Release
+        run: npx semantic-release
+        env:
+          GH_TOKEN: ${{ secrets.GH_TOKEN }}  # Need PAT when protected branch
